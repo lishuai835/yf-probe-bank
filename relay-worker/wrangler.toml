@@ -1,0 +1,6 @@
+name = "yf-probe-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+GITHUB_REPO = "lishuai835/yf-probe-bank"

@@ -1,0 +1,18 @@
+{
+  "schema": "yf-probe-bank-manifest-v1",
+  "version": "2026.10.25.1",
+  "built_at": "2026-10-25T12:00:00.000Z",
+  "published_at": "2026-10-25T12:00:00.000Z",
+  "models": 66,
+  "code_version": "ikale-unified66-v1",
+  "files": {
+    "data/unified_bank.json": {
+      "size": 565210,
+      "sha256": "cdac3c52ebd21ab3df81d78776e5adb8719e8b3514655e361bde2abf8837422e"
+    },
+    "data/shared_detector.json": {
+      "size": 1762881,
+      "sha256": "5ed03b5302cc0b505eaa43f3350e994ee5989020386a5518f3a9d5acd33faf7b"
+    }
+  }
+}

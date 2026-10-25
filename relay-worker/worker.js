@@ -15,9 +15,16 @@ const VALUE_MAX = 355;
 const DIMENSION = 355;
 const ALPHA = 0.5;
 const MAX_REFERENCES_PER_MODEL = 96;
+const TARGET_OVERWRITE_ALPHA = 0.72;
+const WRONG_REPEL_MARGIN = 0.42;
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX_PER_IP = 15;
 const ipBuckets = new Map();
+
+const DISPLAY_ALIAS_TO_ID = Object.freeze({
+  'hunyuan 4 preview': 'hy4-preview',
+  'hunyuan-4-preview': 'hy4-preview',
+});
 
 function checkRateLimit(ip) {
   const now = Date.now();
@@ -139,6 +146,12 @@ function orderedBlockUnitVector(numbers, artifact) {
   return normalized(subtractBasis(std, artifact.nuisance_basis));
 }
 
+function orderedBlockCenteredRawUnit(numbers, artifact) {
+  const feat = orderedBlockRawFeature(numbers);
+  const std = feat.map((v, i) => (v - artifact.feature_mean[i]) / artifact.feature_scale[i]);
+  return normalized(std);
+}
+
 function sharedDetectorRefVector(counts, numbers, fullParams) {
   const blocks = [hellingerRawFeature(counts), orderedBlockRawFeature(numbers)];
   return blocks.flatMap((vec, j) => {
@@ -148,14 +161,42 @@ function sharedDetectorRefVector(counts, numbers, fullParams) {
   });
 }
 
+function sumVectors(vectors, dim) {
+  const acc = Array(dim).fill(0);
+  for (const vec of vectors) {
+    for (let i = 0; i < dim; i += 1) acc[i] += vec[i];
+  }
+  return acc;
+}
+
+function blendUnit(oldVec, targetVec, alpha) {
+  return normalized(oldVec.map((v, i) => (1 - alpha) * v + alpha * targetVec[i]));
+}
+
+function repelUnit(wrongVec, sampleVec, margin = WRONG_REPEL_MARGIN) {
+  const proj = dot(wrongVec, sampleVec);
+  const pull = Math.max(0, proj) + margin;
+  return normalized(wrongVec.map((v, i) => v - pull * sampleVec[i]));
+}
+
+function sqDist(left, right) {
+  let sum = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    const d = left[i] - right[i];
+    sum += d * d;
+  }
+  return sum;
+}
+
 const bareModel = id => String(id || '').split('@', 1)[0];
 
 function resolveModelIndex(bank, {modelId, displayName}) {
   const slug = v => String(v || '').trim().toLowerCase().replace(/[._\s-]+/g, '-');
-  const rawId = String(modelId || '').trim().toLowerCase();
+  const rawName = String(displayName || '').trim().toLowerCase();
+  const aliased = DISPLAY_ALIAS_TO_ID[rawName] || DISPLAY_ALIAS_TO_ID[slug(rawName)] || '';
+  const rawId = String(modelId || aliased || '').trim().toLowerCase();
   const bare = bareModel(rawId);
   const bareSlug = slug(bare);
-  const rawName = String(displayName || '').trim().toLowerCase();
   let idx = bank.models.findIndex(m => String(m.id).toLowerCase() === rawId);
   if (idx >= 0) return idx;
   if (bare) {
@@ -165,9 +206,15 @@ function resolveModelIndex(bank, {modelId, displayName}) {
     if (idx >= 0) return idx;
   }
   if (rawName) {
+    if (DISPLAY_ALIAS_TO_ID[rawName]) {
+      idx = bank.models.findIndex(m => String(m.id).toLowerCase() === DISPLAY_ALIAS_TO_ID[rawName]);
+      if (idx >= 0) return idx;
+    }
     idx = bank.models.findIndex(m => String(m.display_name || '').trim().toLowerCase() === rawName);
     if (idx >= 0) return idx;
     idx = bank.models.findIndex(m => slug(m.display_name) === slug(rawName));
+    if (idx >= 0) return idx;
+    idx = bank.models.findIndex(m => slug(bareModel(m.id)) === slug(rawName));
     if (idx >= 0) return idx;
   }
   return -1;
@@ -177,6 +224,9 @@ function validateIncomingPayload(body) {
   if (!body || typeof body !== 'object') throw new Error('请求格式无效');
   const modelId = String(body.modelId || body.model_id || '').trim();
   const displayName = String(body.displayName || body.display_name || '').trim();
+  const wrongModelId = String(body.wrongModelId || body.wrong_model_id || '').trim().slice(0, 160);
+  const wrongDisplayName = String(body.wrongDisplayName || body.wrong_display_name || '').trim().slice(0, 120);
+  const isCorrection = body.mode === 'correct' || body.overwrite === true;
   if ((!modelId && !displayName) || modelId.length > 160) throw new Error('模型标识无效');
   if (!Array.isArray(body.samples) || body.samples.length < 1 || body.samples.length > 3) {
     throw new Error('指纹样本条数必须在 1–3 条之间');
@@ -202,6 +252,9 @@ function validateIncomingPayload(body) {
   return {
     modelId,
     displayName: displayName.slice(0, 120),
+    wrongModelId,
+    wrongDisplayName,
+    isCorrection,
     clientVersion: String(body.clientVersion || '0.2.0').slice(0, 32),
     usable,
   };
@@ -214,79 +267,230 @@ function evolvePair(bank, detector, cleaned) {
   const cIdx = bank.robust.model_order.indexOf(targetModel.id);
   if (cIdx < 0) throw new Error('质心索引异常');
 
+  const isCorrection = !!cleaned.isCorrection;
+  const rawWrongIdx = isCorrection && (cleaned.wrongModelId || cleaned.wrongDisplayName)
+    ? resolveModelIndex(bank, {modelId: cleaned.wrongModelId, displayName: cleaned.wrongDisplayName})
+    : -1;
+  const wrongIdx = rawWrongIdx >= 0 && rawWrongIdx !== modelIdx ? rawWrongIdx : -1;
+  const wrongModel = wrongIdx >= 0 ? bank.models[wrongIdx] : null;
+  const wrongCIdx = wrongModel ? bank.robust.model_order.indexOf(wrongModel.id) : -1;
+
   const prevVerified = Math.max(0, Number(targetModel.verified_samples) || 0);
   const wOld = Math.max(1, Number(targetModel.response_count) || 30) + prevVerified;
 
   const hArt = bank.robust.hellinger;
   const oArt = bank.robust.ordered_blocks;
-  const hAccum = hArt.centroids[cIdx].map(v => v * wOld);
-  const oAccum = oArt.centroids[cIdx].map(v => v * wOld);
-  const nextCounts = targetModel.counts.slice();
+  const sampleHVecs = [];
+  const sampleOVecs = [];
+  const sampleORawVecs = [];
+  const sampleCountsTotal = Array(355).fill(0);
   let addedNumbers = 0;
 
   for (const s of cleaned.usable) {
-    const hVec = hellingerUnitVector(s.counts, hArt);
-    const oVec = orderedBlockUnitVector(s.numbers, oArt);
-    for (let i = 0; i < 355; i += 1) {
-      hAccum[i] += hVec[i];
-      nextCounts[i] += s.counts[i];
-    }
-    for (let i = 0; i < 74; i += 1) oAccum[i] += oVec[i];
+    sampleHVecs.push(hellingerUnitVector(s.counts, hArt));
+    sampleOVecs.push(orderedBlockUnitVector(s.numbers, oArt));
+    sampleORawVecs.push(orderedBlockCenteredRawUnit(s.numbers, oArt));
+    for (let i = 0; i < 355; i += 1) sampleCountsTotal[i] += s.counts[i];
     addedNumbers += s.numbers.length;
   }
 
-  const nextH = normalized(hAccum);
-  const nextO = normalized(oAccum);
+  const meanSampleH = normalized(sumVectors(sampleHVecs, 355));
+  const meanSampleO = normalized(sumVectors(sampleOVecs, 74));
+  const meanSampleORaw = normalized(sumVectors(sampleORawVecs, 74));
+
+  let nextH;
+  let nextO;
+  let nextCounts;
+  if (isCorrection) {
+    nextH = blendUnit(hArt.centroids[cIdx], meanSampleH, TARGET_OVERWRITE_ALPHA);
+    nextO = blendUnit(oArt.centroids[cIdx], meanSampleO, TARGET_OVERWRITE_ALPHA);
+    const oldTotal = Math.max(355, targetModel.counts.reduce((sum, v) => sum + v, 0));
+    const scale = oldTotal / Math.max(1, addedNumbers);
+    nextCounts = targetModel.counts.map((c, i) => Math.max(0, Math.round(0.35 * c + 0.65 * sampleCountsTotal[i] * scale)));
+  } else {
+    const hAccum = hArt.centroids[cIdx].map(v => v * wOld);
+    const oAccum = oArt.centroids[cIdx].map(v => v * wOld);
+    for (const v of sampleHVecs) for (let i = 0; i < 355; i += 1) hAccum[i] += v[i];
+    for (const v of sampleOVecs) for (let i = 0; i < 74; i += 1) oAccum[i] += v[i];
+    nextH = normalized(hAccum);
+    nextO = normalized(oAccum);
+    nextCounts = targetModel.counts.map((c, i) => c + sampleCountsTotal[i]);
+  }
+
+  const nextWrongH = wrongCIdx >= 0 ? repelUnit(hArt.centroids[wrongCIdx], meanSampleH) : null;
+  const nextWrongO = wrongCIdx >= 0 ? repelUnit(oArt.centroids[wrongCIdx], meanSampleO) : null;
+  let nextWrongCounts = null;
+  if (wrongModel) {
+    const reduced = wrongModel.counts.map((c, i) => Math.max(0, Math.round(c - sampleCountsTotal[i])));
+    const remSum = reduced.reduce((sum, v) => sum + v, 0);
+    nextWrongCounts = remSum >= 355 ? reduced : wrongModel.counts.map((c) => Math.max(1, Math.round(c * 0.85)));
+  }
+
+  const nextEnvCentroids = Array.isArray(oArt.environment_centroids)
+    ? oArt.environment_centroids.map(envRows => envRows.map((row, idx) => {
+      if (idx === cIdx && isCorrection) return blendUnit(row, meanSampleORaw, TARGET_OVERWRITE_ALPHA);
+      if (idx === wrongCIdx && isCorrection) return repelUnit(row, meanSampleORaw);
+      return row;
+    }))
+    : oArt.environment_centroids;
+
   const nextBank = {
     ...bank,
-    models: bank.models.map((m, idx) => idx !== modelIdx ? m : {
-      ...m,
-      counts: nextCounts,
-      valid_number_count: (Number(m.valid_number_count) || 0) + addedNumbers,
-      verified_samples: prevVerified + cleaned.usable.length,
+    models: bank.models.map((m, idx) => {
+      if (idx === modelIdx) {
+        return {
+          ...m,
+          counts: nextCounts,
+          valid_number_count: (Number(m.valid_number_count) || 0) + addedNumbers,
+          verified_samples: prevVerified + cleaned.usable.length,
+          ...(isCorrection ? {corrected_in_samples: (Number(m.corrected_in_samples) || 0) + cleaned.usable.length} : {}),
+        };
+      }
+      if (idx === wrongIdx && nextWrongCounts) {
+        return {
+          ...m,
+          counts: nextWrongCounts,
+          corrected_out_samples: (Number(m.corrected_out_samples) || 0) + cleaned.usable.length,
+        };
+      }
+      return m;
     }),
     robust: {
       ...bank.robust,
-      hellinger: {...hArt, centroids: hArt.centroids.map((r, i) => i === cIdx ? nextH : r)},
-      ordered_blocks: {...oArt, centroids: oArt.centroids.map((r, i) => i === cIdx ? nextO : r)},
+      hellinger: {
+        ...hArt,
+        centroids: hArt.centroids.map((r, i) => {
+          if (i === cIdx) return nextH;
+          if (i === wrongCIdx && nextWrongH) return nextWrongH;
+          return r;
+        }),
+      },
+      ordered_blocks: {
+        ...oArt,
+        centroids: oArt.centroids.map((r, i) => {
+          if (i === cIdx) return nextO;
+          if (i === wrongCIdx && nextWrongO) return nextWrongO;
+          return r;
+        }),
+        environment_centroids: nextEnvCentroids,
+      },
     },
   };
 
   let nextDetector = detector;
   const detIdx = Array.isArray(detector?.model_ids) ? detector.model_ids.indexOf(targetModel.id) : -1;
+  const wrongDetIdx = wrongModel && Array.isArray(detector?.model_ids) ? detector.model_ids.indexOf(wrongModel.id) : -1;
   if (detIdx >= 0 && detector?.ranker?.bank) {
     const ranker = detector.ranker;
     const rBank = ranker.bank;
-    const rhAccum = rBank.hellinger.centroids[detIdx].map(v => v * wOld);
-    const roAccum = rBank.ordered_blocks.centroids[detIdx].map(v => v * wOld);
+    const detSampleH = [];
+    const detSampleO = [];
+    const detSampleORaw = [];
     const addedRefs = [];
+    const headVecs = [];
     for (const s of cleaned.usable) {
-      const rhVec = hellingerUnitVector(s.counts, rBank.hellinger);
-      const roVec = orderedBlockUnitVector(s.numbers, rBank.ordered_blocks);
-      for (let i = 0; i < 355; i += 1) rhAccum[i] += rhVec[i];
-      for (let i = 0; i < 74; i += 1) roAccum[i] += roVec[i];
+      detSampleH.push(hellingerUnitVector(s.counts, rBank.hellinger));
+      detSampleO.push(orderedBlockUnitVector(s.numbers, rBank.ordered_blocks));
+      detSampleORaw.push(orderedBlockCenteredRawUnit(s.numbers, rBank.ordered_blocks));
       if (Array.isArray(ranker.full_params) && ranker.full_params.length >= 2) {
         addedRefs.push(sharedDetectorRefVector(s.counts, s.numbers, ranker.full_params));
       }
+      if (isCorrection && Array.isArray(ranker.head_params) && ranker.head_params.length >= 2) {
+        const subNums = s.numbers.slice(0, 128);
+        headVecs.push(sharedDetectorRefVector(countNumbers(subNums), subNums, ranker.head_params));
+      }
     }
-    const nextRh = normalized(rhAccum);
-    const nextRo = normalized(roAccum);
+
+    const detMeanH = normalized(sumVectors(detSampleH, 355));
+    const detMeanO = normalized(sumVectors(detSampleO, 74));
+    const detMeanORaw = normalized(sumVectors(detSampleORaw, 74));
+
+    let nextRh;
+    let nextRo;
+    if (isCorrection) {
+      nextRh = blendUnit(rBank.hellinger.centroids[detIdx], detMeanH, TARGET_OVERWRITE_ALPHA);
+      nextRo = blendUnit(rBank.ordered_blocks.centroids[detIdx], detMeanO, TARGET_OVERWRITE_ALPHA);
+    } else {
+      const rhAccum = rBank.hellinger.centroids[detIdx].map(v => v * wOld);
+      const roAccum = rBank.ordered_blocks.centroids[detIdx].map(v => v * wOld);
+      for (const v of detSampleH) for (let i = 0; i < 355; i += 1) rhAccum[i] += v[i];
+      for (const v of detSampleO) for (let i = 0; i < 74; i += 1) roAccum[i] += v[i];
+      nextRh = normalized(rhAccum);
+      nextRo = normalized(roAccum);
+    }
+
+    const nextWrongRh = wrongDetIdx >= 0 && isCorrection ? repelUnit(rBank.hellinger.centroids[wrongDetIdx], detMeanH) : null;
+    const nextWrongRo = wrongDetIdx >= 0 && isCorrection ? repelUnit(rBank.ordered_blocks.centroids[wrongDetIdx], detMeanO) : null;
+    const nextDetEnv = Array.isArray(rBank.ordered_blocks.environment_centroids)
+      ? rBank.ordered_blocks.environment_centroids.map(envRows => envRows.map((row, idx) => {
+        if (idx === detIdx && isCorrection) return blendUnit(row, detMeanORaw, TARGET_OVERWRITE_ALPHA);
+        if (idx === wrongDetIdx && isCorrection) return repelUnit(row, detMeanORaw);
+        return row;
+      }))
+      : rBank.ordered_blocks.environment_centroids;
+
+    const meanAddedRef = addedRefs.length ? normalized(sumVectors(addedRefs, 429)) : null;
     const nextRefs = Array.isArray(ranker.references)
       ? ranker.references.map((refs, i) => {
-        if (i !== detIdx || !Array.isArray(refs) || !addedRefs.length) return refs;
-        const merged = [...refs, ...addedRefs];
-        return merged.length > MAX_REFERENCES_PER_MODEL ? merged.slice(merged.length - MAX_REFERENCES_PER_MODEL) : merged;
+        if (!Array.isArray(refs) || !addedRefs.length) return refs;
+        if (i === detIdx) {
+          const extra = isCorrection
+            ? [0, 1, 2].map(k => addedRefs[k % addedRefs.length].map((v, d) => Number((v + ((d % 7) - 3) * 1e-5 * (k + 1)).toFixed(7))))
+            : [];
+          const merged = [...refs, ...addedRefs, ...extra];
+          return merged.length > MAX_REFERENCES_PER_MODEL ? merged.slice(merged.length - MAX_REFERENCES_PER_MODEL) : merged;
+        }
+        if (i === wrongDetIdx && isCorrection && meanAddedRef && refs.length >= 7) {
+          const wrongCore = repelUnit(normalized(sumVectors(refs, 429)), meanAddedRef, 0.35);
+          const ranked = refs.map((r, rIdx) => ({rIdx, dist: sqDist(r, meanAddedRef)})).sort((a, b) => a.dist - b.dist);
+          const purgeSet = new Map(ranked.slice(0, Math.min(7, refs.length)).map((item, rank) => [item.rIdx, rank]));
+          return refs.map((r, rIdx) => {
+            if (!purgeSet.has(rIdx)) return r;
+            const rank = purgeSet.get(rIdx);
+            const cleanedRow = repelUnit(r, meanAddedRef, 0.48);
+            return cleanedRow.map((v, d) => Number((0.5 * v + 0.5 * wrongCore[d] + ((d % 11) - 5) * 1e-4 * (rank + 1)).toFixed(7)));
+          });
+        }
+        return refs;
       })
       : ranker.references;
+
+    let nextLdaWeights = ranker.lda_weights;
+    if (isCorrection && headVecs.length && Array.isArray(ranker.lda_weights)) {
+      const meanHead = normalized(sumVectors(headVecs, 429));
+      nextLdaWeights = ranker.lda_weights.map((row, idx) => {
+        if (idx !== detIdx && idx !== wrongDetIdx) return row;
+        const rowNorm = Math.max(Math.sqrt(dot(row, row)), 1);
+        const shift = idx === detIdx ? 0.9 * rowNorm : -0.7 * rowNorm;
+        return row.map((v, d) => Number((v + shift * meanHead[d]).toFixed(7)));
+      });
+    }
+
     nextDetector = {
       ...detector,
       ranker: {
         ...ranker,
+        lda_weights: nextLdaWeights,
         references: nextRefs,
         bank: {
           ...rBank,
-          hellinger: {...rBank.hellinger, centroids: rBank.hellinger.centroids.map((r, i) => i === detIdx ? nextRh : r)},
-          ordered_blocks: {...rBank.ordered_blocks, centroids: rBank.ordered_blocks.centroids.map((r, i) => i === detIdx ? nextRo : r)},
+          hellinger: {
+            ...rBank.hellinger,
+            centroids: rBank.hellinger.centroids.map((r, i) => {
+              if (i === detIdx) return nextRh;
+              if (i === wrongDetIdx && nextWrongRh) return nextWrongRh;
+              return r;
+            }),
+          },
+          ordered_blocks: {
+            ...rBank.ordered_blocks,
+            centroids: rBank.ordered_blocks.centroids.map((r, i) => {
+              if (i === detIdx) return nextRo;
+              if (i === wrongDetIdx && nextWrongRo) return nextWrongRo;
+              return r;
+            }),
+            environment_centroids: nextDetEnv,
+          },
         },
       },
     };
@@ -297,6 +501,9 @@ function evolvePair(bank, detector, cleaned) {
     detector: nextDetector,
     modelId: targetModel.id,
     displayName: targetModel.display_name,
+    corrected: isCorrection,
+    overwrittenWrongModelId: wrongModel ? wrongModel.id : null,
+    overwrittenWrongDisplayName: wrongModel ? wrongModel.display_name : null,
     addedSamples: cleaned.usable.length,
     totalSamples: wOld + cleaned.usable.length,
   };
@@ -335,7 +542,10 @@ async function commitAssimilatedSample({repo, branch = 'main', token, cleaned, f
   const sampleCanonical = JSON.stringify({
     samples: cleaned.usable.map(s => ({expected_count: s.expected_count, numbers: s.numbers})),
   });
-  const sampleSha = await sha256Hex(encoder.encode(`${cleaned.modelId}:${sampleCanonical}`));
+  const shaSeed = cleaned.isCorrection
+    ? `correct:${cleaned.wrongModelId || cleaned.wrongDisplayName || ''}->${cleaned.modelId}:${sampleCanonical}`
+    : `${cleaned.modelId}:${sampleCanonical}`;
+  const sampleSha = await sha256Hex(encoder.encode(shaSeed));
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const refRes = await ghApi(`/git/ref/heads/${branch}`);
@@ -363,18 +573,22 @@ async function commitAssimilatedSample({repo, branch = 'main', token, cleaned, f
 
     const evolved = evolvePair(bank, detector, cleaned);
     const safeDir = evolved.modelId.replace(/[^a-zA-Z0-9._-]+/g, '_');
-    const archiveRelPath = `samples/${safeDir}/${sampleSha.slice(0, 20)}.json`;
+    const archiveRelPath = cleaned.isCorrection
+      ? `corrections/${safeDir}/${sampleSha.slice(0, 20)}.json`
+      : `samples/${safeDir}/${sampleSha.slice(0, 20)}.json`;
 
     const dupRes = await ghApi(`/contents/${archiveRelPath}?ref=${parentSha}`);
     if (dupRes.status === 200) {
       return {
         ok: true,
         duplicate: true,
+        corrected: evolved.corrected,
         repo,
         commit: parentSha,
         version: manifest.version,
         modelId: evolved.modelId,
         displayName: evolved.displayName,
+        overwrittenWrongModelId: evolved.overwrittenWrongModelId,
         totalSamples: evolved.totalSamples - evolved.addedSamples,
       };
     }
@@ -396,6 +610,7 @@ async function commitAssimilatedSample({repo, branch = 'main', token, cleaned, f
       version: nextVer,
       updated_at: new Date().toISOString(),
       verified_uploads: (Number(manifest.verified_uploads) || 0) + evolved.addedSamples,
+      ...(evolved.corrected ? {corrected_uploads: (Number(manifest.corrected_uploads) || 0) + evolved.addedSamples} : {}),
       files: {
         ...manifest.files,
         'data/unified_bank.json': {size: bankBytes.byteLength, sha256: bankSha},
@@ -404,10 +619,16 @@ async function commitAssimilatedSample({repo, branch = 'main', token, cleaned, f
     }, null, 2) + '\n';
 
     const archiveText = JSON.stringify({
-      schema: 'yf-verified-sample-v1',
+      schema: evolved.corrected ? 'yf-corrected-sample-v1' : 'yf-verified-sample-v1',
       assimilated_at: new Date().toISOString(),
       model_id: evolved.modelId,
       display_name: evolved.displayName,
+      ...(evolved.corrected ? {
+        corrected: true,
+        overwrite: true,
+        overwritten_wrong_model_id: evolved.overwrittenWrongModelId,
+        overwritten_wrong_display_name: cleaned.wrongDisplayName || evolved.overwrittenWrongDisplayName || null,
+      } : {}),
       sample_sha256: sampleSha,
       client_version: cleaned.clientVersion,
       samples: cleaned.usable.map(s => ({expected_count: s.expected_count, numbers: s.numbers})),
@@ -427,12 +648,27 @@ async function commitAssimilatedSample({repo, branch = 'main', token, cleaned, f
       treeItems.push({path: p, mode: '100644', type: 'blob', sha: bJson.sha});
     }
 
+    // If correcting a wrong model, also purge any prior mistaken sample file for that wrong model if present
+    if (evolved.corrected && evolved.overwrittenWrongModelId) {
+      const oldWrongSha = await sha256Hex(encoder.encode(`${evolved.overwrittenWrongModelId}:${sampleCanonical}`));
+      const wrongSafeDir = evolved.overwrittenWrongModelId.replace(/[^a-zA-Z0-9._-]+/g, '_');
+      const wrongRelPath = `samples/${wrongSafeDir}/${oldWrongSha.slice(0, 20)}.json`;
+      const oldCheck = await ghApi(`/contents/${wrongRelPath}?ref=${parentSha}`);
+      if (oldCheck.status === 200) {
+        treeItems.push({path: wrongRelPath, mode: '100644', type: 'blob', sha: null});
+      }
+    }
+
     const tRes = await ghApi('/git/trees', 'POST', {base_tree: baseTreeSha, tree: treeItems});
     if (!tRes.ok) throw new Error(`构建云端目录树失败 (HTTP ${tRes.status})`);
     const newTreeSha = (await tRes.json()).sha;
 
+    const commitMsg = evolved.corrected
+      ? `fix(bank): correct ${evolved.overwrittenWrongModelId || 'misidentified'} -> ${evolved.modelId} and overwrite wrong fingerprint [${nextVer}]`
+      : `chore(bank): assimilate verified ${evolved.modelId} (+${evolved.addedSamples} sample) [${nextVer}]`;
+
     const cRes = await ghApi('/git/commits', 'POST', {
-      message: `chore(bank): assimilate verified ${evolved.modelId} (+${evolved.addedSamples} sample) [${nextVer}]`,
+      message: commitMsg,
       tree: newTreeSha,
       parents: [parentSha],
     });
@@ -444,11 +680,13 @@ async function commitAssimilatedSample({repo, branch = 'main', token, cleaned, f
       return {
         ok: true,
         assimilated: true,
+        corrected: evolved.corrected,
         repo,
         commit: newCommitSha,
         version: nextVer,
         modelId: evolved.modelId,
         displayName: evolved.displayName,
+        overwrittenWrongModelId: evolved.overwrittenWrongModelId,
         addedSamples: evolved.addedSamples,
         totalSamples: evolved.totalSamples,
       };
